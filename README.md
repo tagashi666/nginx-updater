@@ -199,7 +199,7 @@ systemctl list-timers nginx-updater.timer
 
 ```json
 {
-  "script_version": "2.0.1",
+  "script_version": "2.0.2",
   "host": "edge-03",
   "timestamp": "2026-08-08T00:56:04+00:00",
   "dry_run": true,

@@ -135,6 +135,24 @@ t "пусто"                "0" "$NEEDS_MANUAL_N"
 t "EXIT_CODE вернулся в 0" "0" "$EXIT_CODE"
 
 
+echo "--- apt_error_lines находит причину, а не хвост лога ---"
+_LOG=$(mktemp)
+printf '%s\n' \
+  'Reading package lists...' \
+  'dpkg: error processing archive /var/cache/apt/archives/nginx_1.30.4-1~noble_amd64.deb (--unpack):' \
+  " trying to overwrite '/etc/nginx/nginx.conf', which is also in package nginx-common 1.24.0-2ubuntu7.15" \
+  'E: Sub-process /usr/bin/dpkg returned an error code (1)' \
+  '' 'No containers need to be restarted.' \
+  '' 'No user sessions are running outdated binaries.' \
+  '' 'No VM guests are running outdated hypervisor (qemu) binaries on this host.' > "$_LOG"
+_E="$(apt_error_lines "$_LOG")"
+t "нашёл файловый конфликт" "1" "$(grep -c 'also in package' <<< "$_E")"
+t "нашёл код возврата dpkg" "1" "$(grep -c '^E: Sub-process' <<< "$_E")"
+t "needrestart отброшен"    "0" "$(grep -c 'needrestart\|No containers\|No VM guests' <<< "$_E")"
+t "пустой лог не ломает"    "0" "$(apt_error_lines /nonexistent/nope.log | wc -l | tr -d ' ')"
+rm -f "$_LOG"
+
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -33,7 +33,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="2.0.1"
+readonly SCRIPT_VERSION="2.0.2"
 readonly SCRIPT_SELF="${BASH_SOURCE[0]}"
 
 # ============================================================================
@@ -517,6 +517,27 @@ probe_nginx_org_repo() {
   return 1
 }
 
+# Единая неинтерактивная обёртка над apt. needrestart на Ubuntu 24.04 иначе
+# засоряет вывод простынёй "No containers need to be restarted" и умеет
+# перезапускать чужие сервисы без спроса.
+apt_quiet() {
+  DEBIAN_FRONTEND=noninteractive \
+  NEEDRESTART_MODE=l NEEDRESTART_SUSPEND=1 \
+  apt-get "$@" \
+    -o Dpkg::Options::=--force-confold \
+    -o Dpkg::Options::=--force-confdef \
+    </dev/null
+}
+
+# Из лога apt вытащить то, что действительно объясняет сбой, а не хвост вывода:
+# в хвосте обычно болтается needrestart, а настоящая ошибка — выше.
+apt_error_lines() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  grep -iE '^(E:|dpkg: error|dpkg-deb:)|trying to overwrite|is also in package|conffile|unable to |not configured|held broken' "$f" \
+    | head -n 6 || true
+}
+
 ensure_tool() {
   local t="$1" pkgs="$2"
   command -v "$t" >/dev/null 2>&1 && return 0
@@ -524,7 +545,7 @@ ensure_tool() {
   log "доустанавливаю зависимость: $t"
   # shellcheck disable=SC2086
   case "$PKG_FAMILY" in
-    deb) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs </dev/null >/dev/null 2>&1 ;;
+    deb) apt_quiet install -y -qq $pkgs >/dev/null 2>&1 ;;
     rpm) $PKG_CMD install -y -q $pkgs >/dev/null 2>&1 ;;
     apk) apk add --no-cache $pkgs >/dev/null 2>&1 ;;
     zypper) zypper -n install $pkgs >/dev/null 2>&1 ;;
@@ -1065,10 +1086,8 @@ upgrade_via_distro() {
       [[ -z "$pkgs" ]] && pkgs="nginx"
       apt-get update -qq </dev/null >/dev/null 2>&1 || warn "apt-get update отработал с ошибками"
       # shellcheck disable=SC2086
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade \
-        -o Dpkg::Options::=--force-confold \
-        -o Dpkg::Options::=--force-confdef \
-        $pkgs </dev/null 2>&1 | sed 's/^/     /'
+      # shellcheck disable=SC2086
+      apt_quiet install -y --only-upgrade $pkgs 2>&1 | sed 's/^/     /'
       ;;
     rpm)
       $PKG_CMD -y -q update nginx 2>&1 | sed 's/^/     /'
@@ -1198,27 +1217,30 @@ migrate_to_nginx_org() {
       fi
       log "кандидат nginx.org: $cand"
 
-      DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        -o Dpkg::Options::=--force-confold \
-        -o Dpkg::Options::=--force-confdef \
-        nginx </dev/null > "$BACKUP_DIR/apt-install.log" 2>&1 || true
-      tail -n 8 "$BACKUP_DIR/apt-install.log" | sed 's/^/     /'
-
-      if ! dpkg -s nginx 2>/dev/null | grep -qiE 'Maintainer:.*nginx\.(com|org)'; then
-        warn "прямая установка не прошла (конфликт conffile с пакетом дистрибутива)"
-        log "удаляю пакеты дистрибутива и ставлю заново — конфиги уже сохранены"
-        local old_pkgs; old_pkgs="$(installed_nginx_debs | tr '\n' ' ')"
+      # Пакет nginx от nginx.org и nginx-common от дистрибутива владеют одними и
+      # теми же файлами в /etc/nginx. Пока nginx-common стоит, dpkg откажется
+      # распаковывать поверх: "trying to overwrite ..., which is also in package".
+      # Опции --force-conf* тут не помогают — это не conffile-конфликт, а файловый.
+      # Поэтому при наличии пакетов дистрибутива идём сразу через purge, не тратя
+      # минуту на заведомо обречённую попытку.
+      local old_pkgs; old_pkgs="$(installed_nginx_debs | tr '\n' ' ')"
+      if [[ -n "${old_pkgs// /}" ]]; then
+        log "снимаю пакеты дистрибутива (${old_pkgs% }) — они владеют теми же файлами в /etc/nginx"
+        log "конфигурация уже в бэкапе и вернётся после установки"
         # shellcheck disable=SC2086
-        DEBIAN_FRONTEND=noninteractive apt-get purge -y $old_pkgs </dev/null >/dev/null 2>&1 || true
-        # ВАЖНО: сначала ставим пакет, потом возвращаем конфиги. Если положить свои
-        # файлы заранее, dpkg увидит их как изменённые conffile, спросит Y/I/N/O/D/Z,
-        # упрётся в EOF на stdin и оставит пакет в состоянии half-configured.
-        DEBIAN_FRONTEND=noninteractive apt-get install -y \
-          -o Dpkg::Options::=--force-confold \
-          -o Dpkg::Options::=--force-confdef \
-          nginx </dev/null > "$BACKUP_DIR/apt-reinstall.log" 2>&1 || true
-        tail -n 6 "$BACKUP_DIR/apt-reinstall.log" | sed 's/^/     /'
+        apt_quiet purge -y $old_pkgs || true
       fi
+
+      # ВАЖНО: сначала ставим пакет, потом возвращаем конфиги. Если положить свои
+      # файлы заранее, dpkg увидит их как изменённые conffile, спросит Y/I/N/O/D/Z,
+      # упрётся в EOF на stdin и оставит пакет в состоянии half-configured.
+      if ! apt_quiet install -y nginx > "$BACKUP_DIR/apt-install.log" 2>&1; then
+        err "установка nginx из nginx.org не удалась:"
+        apt_error_lines "$BACKUP_DIR/apt-install.log" | sed 's/^/     /'
+        manual "установить nginx из nginx.org вручную (лог: $BACKUP_DIR/apt-install.log)"
+        return 1
+      fi
+      apt_error_lines "$BACKUP_DIR/apt-install.log" | sed 's/^/     /'
       ;;
     rpm)
       add_nginx_org_repo_rpm || return 1
