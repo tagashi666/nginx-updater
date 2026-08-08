@@ -588,7 +588,12 @@ inventory_system() {
 # Какие CVE закрыты бэкпортами дистрибутива — берём из changelog установленного пакета.
 # Это ключевой момент: Ubuntu 24.04 держит nginx 1.24.0, но с пропатченным
 # ngx_http_rewrite_module. По одному лишь `nginx -v` он выглядит уязвимым.
-distro_fixed_cves() {
+# Список отозванных дистрибутивом патчей. Передаётся через файл, а не переменную:
+# open_cves вызывается как "$(open_cves ...)", то есть в субшелле.
+NGXUP_REVERTED_FILE="${NGXUP_REVERTED_FILE:-/tmp/.ngxup-reverted.$$}"
+
+# Сырой changelog установленного пакета.
+changelog_raw() {
   local out=""
   case "$PKG_FAMILY" in
     deb)
@@ -603,25 +608,87 @@ distro_fixed_cves() {
     rpm) out="$(rpm -q --changelog "${SYS_PKG:-nginx}" 2>/dev/null || true)" ;;
     apk) out="$(apk info -a "${SYS_PKG:-nginx}" 2>/dev/null || true)" ;;
   esac
-  printf '%s' "$out" | grep -oiE 'CVE-[0-9]{4}-[0-9]+' | tr 'a-z' 'A-Z' | sort -u
+  printf '%s' "$out"
+}
+
+# Каким CVE дистрибутив ОТОЗВАЛ фикс (ABI-регрессии и т.п.).
+# Дистрибутивы регулярно выкатывают патч, а следующей ревизией отключают его:
+#   1.24.0-2ubuntu7.14  SECURITY UPDATE: ... CVE-2026-42533-1.patch
+#   1.24.0-2ubuntu7.15  SECURITY REGRESSION: ... CVE-2026-42533-*.patch: Disabled for now.
+# Простой grep по CVE-ID увидит второй случай как «закрыто» — то есть наоборот.
+# Идём по записям changelog от новых к старым, первое решение по каждому CVE побеждает.
+distro_fixed_cves() {
+  local raw fixed="" reverted="" entry cve is_revert
+  raw="$(changelog_raw)"
+  [[ -z "$raw" ]] && return 0
+
+  # Записи changelog разделяются строкой, начинающейся с имени пакета: "nginx (версия) ..."
+  # или строкой "* дата - автор - версия" в rpm. Режем по ним, сохраняя порядок (новые сверху).
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    entry="$(printf '%b' "$entry")"
+    # Заголовок регрессии — надёжный маркер: дистрибутивы помечают им именно
+    # отзыв ранее выпущенного фикса. Без него слова вроде "disabled" в тексте
+    # означают, ЧТО ДЕЛАЕТ патч ("disabled duplicate atoms in Mp4"), а "Dropped:
+    # ... replaced with upstream" — что фикс приехал с новой версией. Это не откаты.
+    is_revert=0
+    grep -qiE 'SECURITY REGRESSION|REGRESSION UPDATE' <<< "$entry" && is_revert=1
+
+    while read -r cve; do
+      [[ -z "$cve" ]] && continue
+      # первое встреченное решение (самая свежая запись) — окончательное
+      grep -qxF "$cve" <<< "$fixed$reverted" && continue
+      # внутри записи-регрессии откатанным считается только тот CVE, чей патч
+      # прямо назван отключённым; остальные CVE записи могли быть просто упомянуты
+      if [[ $is_revert -eq 1 ]] \
+         && grep -iE "$cve" <<< "$entry" \
+            | grep -qiE 'disabl|revert|backed out|dropped|removed|no longer' \
+         && ! grep -iE "$cve" <<< "$entry" \
+            | grep -qiE 'replaced with upstream|fixed in [0-9]|superseded'; then
+        reverted+="$cve"$'\n'
+      else
+        fixed+="$cve"$'\n'
+      fi
+    done < <(grep -oiE 'CVE-[0-9]{4}-[0-9]+' <<< "$entry" | tr 'a-z' 'A-Z' | sort -u)
+  done < <(printf '%s' "$raw" | awk '
+      /^[a-zA-Z0-9][a-zA-Z0-9.+-]* \(/ || /^\* [A-Z][a-z][a-z] [A-Z][a-z][a-z] / {
+        if (buf != "") print buf; buf = $0 "\\n"; next
+      }
+      { buf = buf $0 "\\n" }
+      END { if (buf != "") print buf }
+  ')
+
+  # Выводим оба списка с префиксом: функция часто вызывается через $(...),
+  # то есть в субшелле, и присваивание переменных до вызывающего не доживёт.
+  printf '%s' "$fixed"    | grep -v '^$' | sed 's/^/F /' || true
+  printf '%s' "$reverted" | grep -v '^$' | sed 's/^/R /' || true
 }
 
 # Итоговый вердикт: список НЕзакрытых CVE (с учётом бэкпортов)
 open_cves() {
-  local v="$1" fixed line cve sev
+  local v="$1" both fixed reverted line cve sev
+  : > "$NGXUP_REVERTED_FILE" 2>/dev/null || true
   if $SYS_FROM_NGINXORG || $SYS_FROM_SOURCE || [[ "$PKG_FAMILY" == "unknown" ]]; then
     vuln_list "$v"
     return 0
   fi
-  fixed="$(distro_fixed_cves)"
-  if [[ -z "$fixed" ]]; then
+  both="$(distro_fixed_cves)"
+  fixed="$(grep '^F ' <<< "$both" | cut -c3- || true)"
+  reverted="$(grep '^R ' <<< "$both" | cut -c3- || true)"
+  printf '%s' "$reverted" > "$NGXUP_REVERTED_FILE" 2>/dev/null || true
+  if [[ -z "$fixed" && -z "$reverted" ]]; then
     vuln_list "$v"
     return 0
   fi
   while IFS='|' read -r cve sev; do
     [[ -z "$cve" ]] && continue
+    # Отозванный дистрибутивом патч = дыра открыта, даже если CVE упомянут в changelog
+    if [[ -n "$reverted" ]] && grep -qxF "$cve" <<< "$reverted"; then
+      printf '%s|%s\n' "$cve" "$sev"
+      continue
+    fi
     grep -qxF "$cve" <<< "$fixed" && continue
-    echo "$cve|$sev"
+    printf '%s|%s\n' "$cve" "$sev"
   done < <(vuln_list "$v")
 }
 
@@ -1280,6 +1347,20 @@ upgrade_system() {
   local c s
   while IFS='|' read -r c s; do [[ -n "$c" ]] && note "$c ($s)"; done <<< "$SYS_VULNS"
 
+  # Отдельно и громко: дистрибутив выпускал фикс, потом отозвал его.
+  # Обычная логика "нет новой версии в репо — значит всё в порядке" тут врёт:
+  # apt upgrade не поможет, пока мейнтейнер не выпустит исправленный патч.
+  DISTRO_REVERTED_CVES="$(cat "$NGXUP_REVERTED_FILE" 2>/dev/null || true)"
+  if [[ -n "$DISTRO_REVERTED_CVES" ]]; then
+    while read -r c; do
+      [[ -z "$c" ]] && continue
+      grep -q "^$c|" <<< "$SYS_VULNS" || continue
+      err "$c: дистрибутив ВЫПУСТИЛ и затем ОТОЗВАЛ патч (см. changelog пакета $SYS_PKGVER)"
+      note "apt upgrade это не закроет — нужен nginx.org или исправленный патч от мейнтейнера"
+      manual "$c: патч дистрибутива отозван, штатное обновление не поможет"
+    done <<< "$DISTRO_REVERTED_CVES"
+  fi
+
   if $SYS_FROM_SOURCE; then
     err "nginx собран из исходников (не принадлежит ни одному пакету) — пакетный апгрейд невозможен"
     manual "пересобрать nginx $(target_version "$NGINX_TRACK") с флагами из $BACKUP_DIR/nginx-V.txt"
@@ -1899,6 +1980,7 @@ build_json() {
     "package_version": "$(json_esc "$SYS_PKGVER")",
     "source": "$sys_src",
     "patched_by_distro": $SYS_PATCHED_BY_DISTRO,
+    "distro_reverted_patches": $(json_arr "${DISTRO_REVERTED_CVES:-}"),
     "open_cves": $(json_arr "${cves[@]:-}")
   },
   "docker": $dockerj,

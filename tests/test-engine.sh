@@ -57,6 +57,96 @@ t "приватный реестр" "reg.local:5000/nginx:1.30.4" "$(bump_ref re
 t "без тега (порт)" "1" "$(bump_ref reg.local:5000/nginx 1.30.4 >/dev/null; echo $?)"
 t "latest"    "1"                     "$(bump_ref nginx:latest 1.30.4 >/dev/null; echo $?)"
 
+echo "--- распознавание отозванных дистрибутивом патчей ---"
+CL_FIX=$(cat <<'CLEOF'
+nginx (1.24.0-2ubuntu7.15) noble-security; urgency=medium
+
+  * SECURITY REGRESSION: Security fix may break ABI (LP: #2161362)
+    - debian/patches/CVE-2026-42533-*.patch: Disabled for now.
+
+ -- Maintainer <m@example.com>  Mon, 20 Jul 2026 15:12:12 -0400
+
+nginx (1.24.0-2ubuntu7.14) noble-security; urgency=medium
+
+  * SECURITY UPDATE: DoS via map directive
+    - debian/patches/CVE-2026-42533-1.patch: buffer overrun protection.
+    - CVE-2026-42533
+
+ -- Maintainer <m@example.com>  Tue, 01 Jul 2026 10:00:00 -0400
+
+nginx (1.24.0-2ubuntu7.8) noble-security; urgency=medium
+
+  * SECURITY UPDATE: heap overflow in rewrite module
+    - CVE-2026-42945
+
+ -- Maintainer <m@example.com>  Wed, 14 May 2026 10:00:00 -0400
+
+nginx (1.22.1-9ubuntu1) lunar; urgency=medium
+
+  * d/p/CVE-2022-41741_41742.patch: disabled duplicate atoms in Mp4
+    (CVE-2022-41741, CVE-2022-41742)
+  * Dropped:
+      + debian/patches/CVE-2021-23017.patch: removed, replaced with upstream
+
+ -- Maintainer <m@example.com>  Thu, 01 Jun 2023 10:00:00 -0400
+CLEOF
+)
+changelog_raw() { printf '%s' "$CL_FIX"; }
+PKG_FAMILY=deb; SYS_PKG=nginx
+_out="$(distro_fixed_cves)"
+_fix="$(grep '^F ' <<< "$_out" | cut -c3-)"
+_rev="$(grep '^R ' <<< "$_out" | cut -c3-)"
+t "отозванный патч распознан" "1" "$(grep -c 'CVE-2026-42533' <<< "$_rev")"
+t "отозванный не попал в закрытые" "0" "$(grep -c 'CVE-2026-42533' <<< "$_fix")"
+t "Rift остался закрытым" "1" "$(grep -c 'CVE-2026-42945' <<< "$_fix")"
+t "'disabled duplicate atoms' не откат" "0" "$(grep -c 'CVE-2022-41741' <<< "$_rev")"
+t "'replaced with upstream' не откат" "0" "$(grep -c 'CVE-2021-23017' <<< "$_rev")"
+
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
+
+CL_FIX=$(cat <<'CLEOF'
+nginx (1.24.0-2ubuntu7.15) noble-security; urgency=medium
+
+  * SECURITY REGRESSION: Security fix may break ABI (LP: #2161362)
+    - debian/patches/CVE-2026-42533-*.patch: Disabled for now.
+
+ -- Maintainer <m@example.com>  Mon, 20 Jul 2026 15:12:12 -0400
+
+nginx (1.24.0-2ubuntu7.14) noble-security; urgency=medium
+
+  * SECURITY UPDATE: DoS via map directive
+    - debian/patches/CVE-2026-42533-1.patch: buffer overrun protection.
+    - CVE-2026-42533
+
+ -- Maintainer <m@example.com>  Tue, 01 Jul 2026 10:00:00 -0400
+
+nginx (1.24.0-2ubuntu7.8) noble-security; urgency=medium
+
+  * SECURITY UPDATE: heap overflow in rewrite module
+    - CVE-2026-42945
+
+ -- Maintainer <m@example.com>  Wed, 14 May 2026 10:00:00 -0400
+
+nginx (1.22.1-9ubuntu1) lunar; urgency=medium
+
+  * d/p/CVE-2022-41741_41742.patch: disabled duplicate atoms in Mp4
+    (CVE-2022-41741, CVE-2022-41742)
+  * Dropped:
+      + debian/patches/CVE-2021-23017.patch: removed, replaced with upstream
+
+ -- Maintainer <m@example.com>  Thu, 01 Jun 2023 10:00:00 -0400
+CLEOF
+)
+changelog_raw() { printf '%s' "$CL_FIX"; }
+PKG_FAMILY=deb; SYS_PKG=nginx
+_out="$(distro_fixed_cves)"
+_fix="$(grep '^F ' <<< "$_out" | cut -c3-)"
+_rev="$(grep '^R ' <<< "$_out" | cut -c3-)"
+t "отозванный патч распознан" "1" "$(grep -c 'CVE-2026-42533' <<< "$_rev")"
+t "отозванный не попал в закрытые" "0" "$(grep -c 'CVE-2026-42533' <<< "$_fix")"
+t "Rift остался закрытым" "1" "$(grep -c 'CVE-2026-42945' <<< "$_fix")"
+t "'disabled duplicate atoms' не откат" "0" "$(grep -c 'CVE-2022-41741' <<< "$_rev")"
+t "'replaced with upstream' не откат" "0" "$(grep -c 'CVE-2021-23017' <<< "$_rev")"
