@@ -1,0 +1,28 @@
+[{
+ "Id":"abc123def456789",
+ "Name":"/web",
+ "Config":{
+   "Hostname":"abc123def456",
+   "Image":"nginx:1.24.0-alpine",
+   "Env":["PATH=/usr/local/sbin:/usr/bin","NGINX_VERSION=1.24.0","TZ=Europe/Moscow","APP_ENV=prod"],
+   "Labels":{"com.example.role":"edge","maintainer":"NGINX Docker Maintainers","org.opencontainers.image.version":"1.24.0"},
+   "Cmd":["nginx","-g","daemon off;"],
+   "Entrypoint":["/docker-entrypoint.sh"],
+   "User":"","WorkingDir":""
+ },
+ "HostConfig":{
+   "Binds":["/etc/nginx/conf.d:/etc/nginx/conf.d:ro","certs:/etc/ssl/private"],
+   "PortBindings":{"80/tcp":[{"HostIp":"","HostPort":"80"}],"443/tcp":[{"HostIp":"127.0.0.1","HostPort":"8443"}]},
+   "RestartPolicy":{"Name":"unless-stopped","MaximumRetryCount":0},
+   "NetworkMode":"edge-net",
+   "CapAdd":["NET_ADMIN"],"CapDrop":null,"Privileged":false,
+   "Sysctls":{"net.core.somaxconn":"4096"},
+   "ExtraHosts":["panel:10.0.0.5"],"Dns":[],"SecurityOpt":null,"GroupAdd":null,
+   "Devices":[],"Ulimits":[{"Name":"nofile","Soft":65535,"Hard":65535}],
+   "LogConfig":{"Type":"json-file","Config":{"max-size":"10m"}},
+   "IpcMode":"private","PidMode":"","ShmSize":67108864,"Memory":0,"NanoCpus":0,
+   "CgroupParent":"","Runtime":"runc"
+ },
+ "Mounts":[{"Type":"bind","Destination":"/etc/nginx/conf.d"},{"Type":"volume","Destination":"/etc/ssl/private"}],
+ "NetworkSettings":{"Networks":{"edge-net":{"Aliases":["web","abc123def456"],"IPAMConfig":{"IPv4Address":"172.20.0.10"}},"monitoring":{"Aliases":["web"]}}}
+}]

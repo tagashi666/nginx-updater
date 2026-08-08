@@ -1,136 +1,192 @@
 # nginx-updater
 
-Automated, idempotent nginx upgrade tool for **[CVE-2026-42945](https://nginx.org/en/security_advisories.html)** (NGINX Rift, CVSS 9.2) — and any future nginx security campaign.
+Автоматический патчер nginx под **[CVE-2026-42945](https://nginx.org/en/security_advisories.html)** (NGINX Rift, CVSS 9.2) и всю волну уязвимостей, вышедшую следом.
+
+Один bash-скрипт. Кидаешь на сервер, запускаешь, он сам разбирается, что у тебя стоит, чем это чинить и не сломалось ли что-то после.
 
 [![Shellcheck](https://github.com/tagashi666/nginx-updater/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/tagashi666/nginx-updater/actions/workflows/shellcheck.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## TL;DR
-
-A single bash script you drop on any Linux server. It auto-detects:
-
-- **System nginx** — Debian / Ubuntu / RHEL / Alma / Rocky / Oracle / Fedora
-- **Docker nginx** — managed by `docker compose`
-
-It checks the running version, upgrades to a non-vulnerable release, runs `nginx -t`, performs a full restart (not reload), and verifies. With backup. Idempotent.
-
-```bash
-# Dry-run first — change nothing, just report
-curl -fsSL https://raw.githubusercontent.com/tagashi666/nginx-updater/main/nginx-upgrade.sh \
-  | sudo bash -s -- --check
-```
-
-## About CVE-2026-42945
-
-A heap buffer overflow in `ngx_http_rewrite_module`, present in nginx since version 0.6.27 (2008). Enables unauthenticated remote code execution under specific rewrite configurations. Disclosed by F5 and depthfirst on **May 13, 2026**.
-
-| | |
-|---|---|
-| **Affected** | nginx OSS 0.6.27 – 1.30.0, NGINX Plus R32 – R36 |
-| **Fixed in** | nginx 1.30.1 (stable), 1.31.0 (mainline) |
-| **CVSS v4** | 9.2 (Critical) |
-| **Auth** | None required |
-| **PoC** | Public |
-
-## Features
-
-- **Idempotent** — re-runs on already-patched servers exit clean with code 0
-- **Dry-run mode** (`--check`) for safe fleet-wide preview
-- **Auto-detection** of OS family and Docker Compose stacks via container labels
-- **Pre-flight `nginx -t`** — bad configs never kill the running service
-- **Backup** of `/etc/nginx`, installed packages list, and `docker inspect` snapshots before any change
-- **Structured exit codes** for orchestration:
-  - `0` — success (or nothing to do)
-  - `1` — fatal error
-  - `2` — partial success, manual action required
-- **Refuses dangerous operations** — won't recreate raw `docker run` containers blind, won't override pinned compose tags
-
-## Quick start
-
-### Inspect first (this is a security tool — read what you run)
-
 ```bash
 git clone https://github.com/tagashi666/nginx-updater.git
 cd nginx-updater
-less nginx-upgrade.sh
+sudo bash nginx-upgrade.sh --check   # сначала посмотреть, потом без --check
 ```
 
-### Dry-run
+---
+
+## Что изменилось в 2.0 (и почему это важно)
+
+### 1. Больше не ломает сайты
+
+Главная жалоба на 1.x: после обновления пропадала строка `include /etc/nginx/sites-enabled/*;`, и все виртуальные хосты переставали обслуживаться. При этом `nginx -t` говорил «syntax is ok» — конфиг валиден, просто пустой.
+
+Корневая причина оказалась не в самой вставке, а раньше: **скрипт зря считал сервер уязвимым**.
+
+Дистрибутивы не поднимают номер версии, они бэкпортят патч. Ubuntu 24.04 держит `nginx 1.24.0`, но пакет `1.24.0-2ubuntu7.8` уже содержит фикс Rift. Старый скрипт видел `nginx -v` → `1.24.0` → «меньше 1.30.1» → «уязвим» → тащил репозиторий nginx.org → пакет nginx.org подменял `nginx.conf` своим, в котором есть только `include conf.d/*.conf`. Сайты исчезали на ровном месте, притом что чинить было нечего.
+
+Версия 2.0 читает changelog установленного пакета и видит там реальные CVE:
+
+```
+✓ системный nginx 1.24.0 (пакет 1.24.0-2ubuntu7.15) — уязвимости закрыты бэкпортами дистрибутива
+```
+
+Ничего не трогается. Ноль риска.
+
+Если дистрибутив действительно отстаёт — скрипт сначала пробует штатный `apt upgrade`, и только если и это не помогло, идёт на nginx.org — уже с полным сохранением и восстановлением конфигурации.
+
+### 2. Порог безопасности перестал быть устаревшим
+
+`1.30.1` закрывает Rift, но после него вышло ещё четыре адвизори, включая **major** CVE-2026-42533. Скрипт 1.x считал `1.30.1` чистой версией и пропускал уязвимый сервер.
+
+Сейчас порог — **1.30.4 / 1.31.3**, и он не захардкожен: при запуске скрипт подтягивает актуальную таблицу с `nginx.org/en/security_advisories.html` и пересчитывает её сам. Нет сети — работает по встроенному слепку. Следующая волна CVE подхватится без обновления скрипта.
+
+### 3. Чинит конфиг, а не только версию
+
+- нет `include sites-enabled` / `include conf.d` — вставляет в блок `http{}` и проверяет `nginx -t`
+- в конфиге `user www-data;`, а пользователя нет — создаёт и раздаёт права на кеш-каталоги
+- `modules-enabled` тянет несуществующий `.so` — отключает конкретный файл, на который ругнулся nginx
+- `listen 443 ssl http2;` (deprecated с 1.25.1) — переписывает на `http2 on;`, **но только в тех server-блоках, где все listen идут с ssl** — иначе включился бы h2c на 80-м порту
+- stock `conf.d/default.conf` от nginx.org перебивает твой default_server — отключает
+
+Каждое изменение проверяется `nginx -t` и откатывается поштучно, если не проходит.
+
+### 4. Проверяет результат, а не верит на слово
+
+До апгрейда снимается слепок слушающих сокетов и HTTP-ответов с каждого порта. После — сравнивается. Пропал сокет или порт перестал отвечать → конфигурация откатывается автоматически.
+
+`systemctl is-active` недостаточно: nginx умеет быть «active» и при этом не обслуживать ничего.
+
+### 5. Docker — до конца, а не «сделай сам»
+
+| Ситуация | 1.x | 2.0 |
+|---|---|---|
+| compose с плавающим тегом | pull + up | то же |
+| compose с запиненным тегом `nginx:1.25.3-alpine` | отказ, «правь вручную» | сам поднимает тег до `1.30.4-alpine` (бэкап compose-файла), правит и `.env` |
+| образ собран локально | отказ | `compose build --pull` |
+| `docker run` без compose | отказ, «вот тебе inspect» | пересоздаёт по слепку с rename-откатом |
+| OpenResty | считался nginx'ом | распознаётся отдельно |
+
+Пересоздание raw-контейнера: старый останавливается и переименовывается в `<имя>-preupgrade`, новый поднимается с воспроизведёнными параметрами (порты, тома, сети с алиасами и статикой, env, cap, sysctl, ulimit, лимиты). Не прошёл проверку — старый возвращается на место. Ничего не удаляется, `docker rm` за тобой.
+
+Перед пересозданием версия nginx **внутри нового образа** проверяется отдельно — бессмысленный рестарт прода не случится.
+
+### 6. Мелочи, которые чинились по дороге
+
+- цвета не работали никогда: `[[ -t 1 ]]` проверялся **после** подмены stdout на пайп
+- `--help` ломался при запуске через `curl | bash` (читал `$0`)
+- `mkdir /var/log/...` выполнялся до проверки root — не-root получал невнятную ошибку вместо понятной
+- репозиторий nginx.org прописывался вслепую; на Mint/Pop/Kali/Astra или свежем Ubuntu это давало 404 в `apt update`, а скрипт ехал дальше. Теперь пара (дистрибутив, кодовое имя) **проверяется HTTP-запросом** до записи в sources.list
+- `curl` и `gnupg` использовались без проверки — на минимальных образах их нет; теперь доустанавливаются
+- SIGPIPE на `grep | head` иногда терял версию, а неизвестная версия считалась безопасной (fail-open). Теперь fail-closed
+- `${#array[@]}` на пустом массиве под `set -u` падал на bash 4.2 (CentOS 7)
+- `grep 'nginx.org'` по sources.list матчил **закомментированные** строки
+- ERR-трап не срабатывал внутри функций (нет `set -E`), а `func || true` глушил `set -e` на всё тело функции
+- регулярка детекта запиненного тега содержала `\x27`, который ERE не понимает
+
+---
+
+## Использование
 
 ```bash
-sudo ./nginx-upgrade.sh --check
+sudo bash nginx-upgrade.sh --check          # отчёт, ничего не менять
+sudo bash nginx-upgrade.sh                  # применить
+sudo bash nginx-upgrade.sh --install-timer  # ежедневная автопроверка
 ```
 
-### Apply
+### Флаги
 
-```bash
-sudo ./nginx-upgrade.sh
-```
-
-### Flags
-
-| Flag | Description |
+| Флаг | Что делает |
 |---|---|
-| `--check`, `--dry-run` | Report state, change nothing |
-| `--skip-system` | Don't touch system nginx |
-| `--skip-docker` | Don't touch Docker containers |
-| `--stable` | Install stable branch (default — e.g. 1.30.x) |
-| `--mainline` | Install mainline branch (e.g. 1.31.x) |
-| `-h`, `--help` | Show help |
+| `--check`, `--dry-run` | только отчёт |
+| `--json ФАЙЛ` | машиночитаемый отчёт |
+| `--quiet` | тише (для cron) |
+| `--skip-system` / `--skip-docker` | не трогать системный nginx / контейнеры |
+| `--distro-only` | никогда не подключать nginx.org |
+| `--prefer-upstream` | сразу nginx.org, не пробуя дистрибутив |
+| `--stable` / `--mainline` | ветка (по умолчанию stable) |
+| `--severity LEVEL` | порог для миграции на nginx.org: `critical\|major\|medium\|low` (по умолчанию `major`) |
+| `--no-fix-config` / `--no-fix-http2` | не чинить конфиг / не мигрировать http2 |
+| `--no-recreate` | не пересоздавать raw docker-контейнеры |
+| `--no-rollback` | не откатываться автоматически |
+| `--no-refresh` | не ходить на nginx.org за таблицей CVE |
+| `--install-timer` / `--uninstall-timer` | systemd-таймер |
 
-## Fleet deployment
+`NGXUP_WEBHOOK=https://...` — POST-нуть JSON-отчёт после прогона.
 
-### xargs fan-out
+### Коды возврата
+
+`0` — чисто · `1` — ошибка или осталось уязвимое · `2` — нужна ручная работа
+
+---
+
+## Флот
 
 ```bash
-mkdir -p logs
-cat hosts.txt | xargs -P8 -I{} sh -c '
+mkdir -p logs reports
+xargs -a hosts.txt -P8 -I{} sh -c '
   scp -q nginx-upgrade.sh root@{}:/tmp/ &&
-  ssh root@{} "bash /tmp/nginx-upgrade.sh --check" > "logs/{}.log" 2>&1 &&
+  ssh root@{} "bash /tmp/nginx-upgrade.sh --check --quiet --json /tmp/r.json" > logs/{}.log 2>&1
+  scp -q root@{}:/tmp/r.json reports/{}.json 2>/dev/null
   echo "{}: $?"
 '
+jq -r 'select(.system.open_cves|length>0) | .host' reports/*.json
 ```
 
-### Ansible
+Ansible:
 
 ```yaml
 - hosts: web_servers
   become: true
   tasks:
-    - name: Run nginx upgrade
-      script: nginx-upgrade.sh --check    # remove --check to apply
-      register: result
-      failed_when: result.rc == 1
-      changed_when: result.rc == 0 and 'УЯЗВИМ' not in result.stdout
+    - name: nginx security upgrade
+      script: nginx-upgrade.sh --quiet --json /tmp/nginx-updater.json
+      register: r
+      failed_when: r.rc == 1
+      changed_when: r.rc == 0
 ```
 
-## What it does NOT handle
+---
 
-For these scenarios, see the [manual runbook](docs/RUNBOOK.md):
+## Что скрипт не делает
 
-- **Custom-built nginx** (compiled from source) — package managers can't replace it
-- **OpenResty** — separate upstream with its own release cycle
-- **nginx in Kubernetes Ingress controllers** — use Helm chart upgrade
-- **Raw `docker run` containers** — script detects them, saves `docker inspect` snapshot, and asks you to recreate manually with the right volumes/ports/env
+| Случай | Почему | Что делает вместо |
+|---|---|---|
+| nginx собран из исходников | пакетный менеджер его не заменит | сохраняет `nginx -V` и пишет, что пересобрать |
+| OpenResty | свой цикл релизов | детектит и отмечает как ручную работу |
+| ingress-nginx | проект Kubernetes закрыт в марте 2026, апстрим-патча не будет | предупреждает |
+| nginx из snap | своё обновление | предупреждает |
+| остановленные контейнеры | могут быть остановлены намеренно | только перечисляет |
 
-## Safety guarantees
+Подробности по каждому — в [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
-- Always backs up `/etc/nginx` to `/root/nginx-backup-<timestamp>/` before changes
-- Always runs `nginx -t` before any restart
-- Logs everything to `/var/log/nginx-upgrade/upgrade-<timestamp>.log`
-- Exits non-zero on failure — no silent breakage
-- Verifies the version is actually safe after upgrade (catches package-manager weirdness)
+---
 
-Still — **test on a staging host first**. This is the kind of tool you don't run blind in prod.
+## Безопасность
 
-## Output language
+- бэкап `/etc/nginx` (tarball + распакованное дерево для восстановления), списка пакетов, `nginx -V`, `docker inspect` — до любых изменений, в `/var/backups/nginx-updater/<timestamp>/`
+- `nginx -t` перед каждым рестартом и после каждой правки конфига
+- полный `restart`, не `reload` — фикс затрагивает heap-разметку воркеров
+- слепок слушающих сокетов до/после + дымовой тест каждого порта
+- целевая версия сверяется с апстрим-таблицей, а не берётся на веру
+- всё в `/var/log/nginx-upgrade/`
 
-The script's user-facing output is currently in Russian. PRs adding `--lang en` are welcome.
+Скрипт можно подключить как библиотеку без побочных эффектов:
 
-## Contributing
+```bash
+NGXUP_LIB_ONLY=1 source nginx-upgrade.sh
+vuln_list 1.30.1      # какие CVE открыты в этой версии
+target_version stable # текущая безопасная версия
+```
 
-Issues and PRs welcome. Please run `shellcheck nginx-upgrade.sh` before submitting.
+И всё же — сначала стенд. Это тот инструмент, который не запускают вслепую на проде.
 
-## License
+---
+
+## Язык вывода
+
+Сообщения на русском. PR с `--lang en` приветствуется.
+
+## Лицензия
 
 [MIT](LICENSE)

@@ -1,0 +1,6 @@
+[{"Config":{
+  "Env":["PATH=/usr/local/sbin:/usr/bin","NGINX_VERSION=1.30.4"],
+  "Cmd":["nginx","-g","daemon off;"],
+  "Entrypoint":["/docker-entrypoint.sh"],
+  "Labels":{"maintainer":"NGINX Docker Maintainers"},
+  "User":"","WorkingDir":""}}]

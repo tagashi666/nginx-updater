@@ -1,0 +1,10 @@
+# Bash-скрипты ВСЕГДА с LF, иначе на Linux будет
+# "/bin/bash^M: bad interpreter: No such file or directory"
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+LICENSE text eol=lf
+
+# Фикстуры тестов не трогать
+tests/fixtures/** -text
