@@ -88,7 +88,7 @@ sudo bash nginx-upgrade.sh            # применить
 |---|---|
 | нет `include sites-enabled` / `conf.d` | вставляет в блок `http{}` |
 | `user www-data;`, а пользователя нет | создаёт системного пользователя, раздаёт права на кеш-каталоги |
-| `modules-enabled` тянет незагружаемый `.so` | отключает конкретный файл, на который ругнулся nginx |
+| `modules-enabled` содержит висячий симлинк или ссылку на отсутствующий `.so` | отключает такие записи и перечисляет их в отчёте |
 | `listen 443 ssl http2;` (deprecated с 1.25.1) | переписывает на `http2 on;` |
 | stock `conf.d/default.conf` от nginx.org перебивает ваш `default_server` | отключает |
 
@@ -199,7 +199,7 @@ systemctl list-timers nginx-updater.timer
 
 ```json
 {
-  "script_version": "2.0.2",
+  "script_version": "2.0.3",
   "host": "edge-03",
   "timestamp": "2026-08-08T00:56:04+00:00",
   "dry_run": true,

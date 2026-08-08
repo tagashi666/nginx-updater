@@ -33,7 +33,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="2.0.2"
+readonly SCRIPT_VERSION="2.0.3"
 readonly SCRIPT_SELF="${BASH_SOURCE[0]}"
 
 # ============================================================================
@@ -602,8 +602,19 @@ inventory_system() {
     deb)
       SYS_PKG="$(dpkg -S "$real" 2>/dev/null | head -n1 | cut -d: -f1)"
       [[ -n "$SYS_PKG" ]] && SYS_PKGVER="$(dpkg-query -W -f='${Version}' "$SYS_PKG" 2>/dev/null || true)"
-      if [[ -n "$SYS_PKG" ]] && dpkg -s "$SYS_PKG" 2>/dev/null | grep -qiE 'Maintainer:.*nginx\.(com|org)'; then
-        SYS_FROM_NGINXORG=true
+      # Один Maintainer — ненадёжно: поле меняется между релизами, а после
+      # прерванного dpkg запись вообще может быть неполной. Смотрим несколько
+      # признаков сразу. Ошибка здесь дорогая: пакет nginx.org, ошибочно принятый
+      # за дистрибутивный, отправит нас искать бэкпорты в changelog, которого нет.
+      if [[ -n "$SYS_PKG" ]]; then
+        local meta
+        meta="$(dpkg -s "$SYS_PKG" 2>/dev/null || true)"
+        if grep -qiE '^(Maintainer|Homepage|Original-Maintainer):.*nginx\.(com|org)' <<< "$meta" \
+           || [[ "$SYS_PKGVER" =~ -[0-9]+~[a-z]+$ ]] \
+           || apt-cache policy "$SYS_PKG" 2>/dev/null \
+                | grep -A1 -F "*** $SYS_PKGVER" | grep -qi 'nginx\.org'; then
+          SYS_FROM_NGINXORG=true
+        fi
       fi
       ;;
     rpm)
@@ -918,6 +929,77 @@ repair_conf_user() {
 # Отключаем ТОЛЬКО те файлы modules-enabled, на которые ругается сам nginx.
 # Раньше здесь резолвился путь load_module относительно /etc/nginx — неверно:
 # nginx резолвит его относительно --modules-path (обычно /usr/lib/nginx/modules).
+# Существует ли модуль, указанный в load_module.
+#
+# Относительный путь nginx резолвит от --prefix, а не от каталога с nginx.conf
+# и не от --modules-path. На Ubuntu это /usr/share/nginx, где modules — симлинк
+# на /usr/lib/nginx/modules. Проверяем все разумные варианты и считаем модуль
+# отсутствующим, только если не нашли нигде: ошибочно отключить рабочий модуль
+# хуже, чем оставить битый — битый поймает nginx -t.
+module_exists() {
+  local so="$1" prefix mp
+  [[ -z "$so" ]] && return 0
+  [[ "$so" == /* ]] && { [[ -e "$so" ]]; return; }
+  prefix="$(nginx -V 2>&1 | tr ' ' '\n' | sed -n 's|^--prefix=||p' | head -1)"
+  mp="$(nginx -V 2>&1 | tr ' ' '\n' | sed -n 's|^--modules-path=||p' | head -1)"
+  [[ -n "$prefix" && -e "$prefix/$so" ]] && return 0
+  [[ -n "$mp" && -e "$mp/$so" ]] && return 0
+  [[ -n "$mp" && -e "$mp/$(basename "$so")" ]] && return 0
+  [[ -e "$SYS_PREFIX/$so" ]] && return 0
+  return 1
+}
+
+# Убрать записи modules-enabled, которым больше нечего загружать.
+#
+# После ухода с пакетов дистрибутива на nginx.org динамические модули
+# (libnginx-mod-http-geoip2, -image-filter, -xslt-filter, -stream ...) удаляются
+# вместе со своими .so и файлами в modules-available. А в modules-enabled лежат
+# СИМЛИНКИ на них, и они восстанавливаются из бэкапа висячими. nginx разворачивает
+# include modules-enabled/*.conf по glob, наталкивается на битую ссылку и падает:
+#   [emerg] open() ".../50-mod-http-geoip2.conf" failed (2: No such file or directory)
+# Без этой уборки пользовательский nginx.conf выглядит несовместимым с новой
+# версией и заменяется дефолтным — то есть человек теряет свои настройки на ровном месте.
+PRUNED_MODULES=""
+prune_dead_modules() {
+  local d="$SYS_PREFIX/modules-enabled" f so base
+  [[ -d "$d" ]] || return 0
+  PRUNED_MODULES=""
+  for f in "$d"/*; do
+    [[ -e "$f" || -L "$f" ]] || continue
+    base="$(basename "$f")"
+    [[ "$base" == *.disabled-by-nginx-updater ]] && continue
+
+    # висячий симлинк — цель уехала вместе с пакетом
+    if [[ -L "$f" && ! -e "$f" ]]; then
+      mv "$f" "$f.disabled-by-nginx-updater" 2>/dev/null || continue
+      PRUNED_MODULES+="$base"$'\n'
+      continue
+    fi
+    [[ -f "$f" ]] || continue
+
+    # .so, на который ссылается load_module, отсутствует
+    while read -r so; do
+      [[ -z "$so" ]] && continue
+      if ! module_exists "$so"; then
+        mv "$f" "$f.disabled-by-nginx-updater" 2>/dev/null && PRUNED_MODULES+="$base"$'\n'
+        break
+      fi
+    done < <(grep -hoE '^[^#]*load_module[[:space:]]+"?[^";]+' "$f" 2>/dev/null \
+             | sed 's/.*load_module[[:space:]]*//; s/^"//' )
+  done
+
+  PRUNED_MODULES="$(printf '%s' "$PRUNED_MODULES" | grep -v '^$' || true)"
+  if [[ -n "$PRUNED_MODULES" ]]; then
+    local n; n="$(wc -l <<< "$PRUNED_MODULES" | tr -d ' ')"
+    warn "отключено записей modules-enabled без модуля: $n"
+    while read -r base; do [[ -n "$base" ]] && note "$base"; done <<< "$PRUNED_MODULES"
+    note "если модуль нужен — в репозитории nginx.org есть пакеты nginx-module-*"
+    conf_fixed "отключены модули без .so ($n шт.)"
+    manual "проверить, не используются ли директивы отключённых модулей: $(tr '\n' ' ' <<< "$PRUNED_MODULES")"
+  fi
+  return 0
+}
+
 repair_modules() {
   [[ -d "$SYS_PREFIX/modules-enabled" ]] || return 0
   nginx_test && return 0
@@ -927,8 +1009,8 @@ repair_modules() {
     tries=$((tries + 1))
     out="$(nginx -t 2>&1)"
     nginx_test && break
-    grep -qiE 'dlopen|load_module|module .* is not binary compatible' <<< "$out" || break
-    file="$(grep -oE 'in [^ ]*modules-enabled/[^:]+' <<< "$out" | head -n1 | sed 's/^in //')"
+    grep -qiE 'dlopen|load_module|not binary compatible|open\(\).*modules-enabled' <<< "$out" || break
+    file="$(grep -oE '[^ "]*modules-enabled/[^" :]+' <<< "$out" | head -n1)"
     [[ -z "$file" || ! -f "$file" ]] && break
     warn "nginx не может загрузить модуль из $(basename "$file") — отключаю файл"
     mv "$file" "$file.disabled-by-nginx-updater"
@@ -1045,6 +1127,7 @@ repair_config() {
 
   local manual_before=$NEEDS_MANUAL_N
   repair_conf_user
+  prune_dead_modules
   repair_modules
   disable_stock_default
   repair_include_dirs
@@ -1172,6 +1255,7 @@ reconcile_nginx_conf() {
   cp -a "$SYS_CONF" "$SYS_PREFIX/nginx.conf.nginx-org-default" 2>/dev/null || true
   cp -a "$old" "$SYS_CONF"
   repair_conf_user
+  prune_dead_modules
   repair_modules
   if nginx_test; then
     ok "твой nginx.conf принят новым бинарём (дефолтный сохранён как nginx.conf.nginx-org-default)"

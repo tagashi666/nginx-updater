@@ -153,6 +153,29 @@ t "пустой лог не ломает"    "0" "$(apt_error_lines /nonexistent
 rm -f "$_LOG"
 
 
+echo "--- уборка modules-enabled без модуля ---"
+_MD=$(mktemp -d); mkdir -p "$_MD/modules-enabled" "$_MD/real"
+ln -sf "$_MD/real/gone.conf"  "$_MD/modules-enabled/50-dangling.conf"   # цель удалена
+: > "$_MD/real/here.conf"
+ln -sf "$_MD/real/here.conf"  "$_MD/modules-enabled/51-live-link.conf"  # цель на месте
+echo 'load_module modules/ngx_ghost_module.so;' > "$_MD/modules-enabled/70-ghost.conf"
+SYS_PREFIX="$_MD"; QUIET=true
+prune_dead_modules >/dev/null 2>&1
+t "висячий симлинк отключён"  "1" "$(ls "$_MD/modules-enabled" | grep -c '^50-dangling.conf.disabled-by-nginx-updater$')"
+t "живой симлинк не тронут"   "1" "$(ls "$_MD/modules-enabled" | grep -c '^51-live-link.conf$')"
+t "отсутствующий .so отключён" "1" "$(ls "$_MD/modules-enabled" | grep -c '^70-ghost.conf.disabled-by-nginx-updater$')"
+t "повторный прогон идемпотентен" "3" "$(prune_dead_modules >/dev/null 2>&1; ls "$_MD/modules-enabled" | wc -l | tr -d ' ')"
+t "нет каталога — не падает"  "0" "$(SYS_PREFIX=/nonexistent prune_dead_modules >/dev/null 2>&1; echo $?)"
+rm -rf "$_MD"
+
+echo "--- источник пакета по версии ---"
+_src() { [[ "$1" =~ -[0-9]+~[a-z]+$ ]] && echo nginx.org || echo distro; }
+t "1.30.4-1~noble"      "nginx.org" "$(_src 1.30.4-1~noble)"
+t "1.30.4-1~jammy"      "nginx.org" "$(_src 1.30.4-1~jammy)"
+t "1.24.0-2ubuntu7.15"  "distro"    "$(_src 1.24.0-2ubuntu7.15)"
+t "1.18.0-6ubuntu14.18" "distro"    "$(_src 1.18.0-6ubuntu14.18)"
+
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
