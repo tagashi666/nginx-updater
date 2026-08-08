@@ -33,7 +33,7 @@
 
 set -uo pipefail
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.0.1"
 readonly SCRIPT_SELF="${BASH_SOURCE[0]}"
 
 # ============================================================================
@@ -252,6 +252,20 @@ note()   { $QUIET && return 0; echo "   ${CYAN}→${NC} $*"; }
 die() { err "$*"; EXIT_CODE=1; print_summary 2>/dev/null || true; flush_log; exit 1; }
 
 manual() { NEEDS_MANUAL+=("$1"); NEEDS_MANUAL_N=$((NEEDS_MANUAL_N + 1)); [[ $EXIT_CODE -eq 0 ]] && EXIT_CODE=2; return 0; }
+
+# Снять пометки, потерявшие смысл. Пример: до апгрейда записали «патч дистрибутива
+# отозван», потом успешно уехали на nginx.org — CVE закрыт, а пометка висит и
+# превращает честное «ЧИСТО» в пугающее «ЧАСТИЧНО».
+manual_drop() {
+  local pat="$1" keep=() m
+  for m in ${NEEDS_MANUAL[@]+"${NEEDS_MANUAL[@]}"}; do
+    [[ "$m" == *"$pat"* ]] || keep+=("$m")
+  done
+  NEEDS_MANUAL=(${keep[@]+"${keep[@]}"})
+  NEEDS_MANUAL_N=${#NEEDS_MANUAL[@]}
+  [[ $NEEDS_MANUAL_N -eq 0 && $EXIT_CODE -eq 2 ]] && EXIT_CODE=0
+  return 0
+}
 acted()  { ACTIONS+=("$1"); ACTIONS_N=$((ACTIONS_N + 1)); return 0; }
 
 # ============================================================================
@@ -592,76 +606,69 @@ inventory_system() {
 # open_cves вызывается как "$(open_cves ...)", то есть в субшелле.
 NGXUP_REVERTED_FILE="${NGXUP_REVERTED_FILE:-/tmp/.ngxup-reverted.$$}"
 
-# Сырой changelog установленного пакета.
+# Сырой changelog установленного пакета. Стримом, без $( ) — changelog бывает
+# бинарно грязным (NUL, последовательности \x), а подстановка их калечит.
 changelog_raw() {
-  local out=""
   case "$PKG_FAMILY" in
     deb)
       local d f
       for d in "$SYS_PKG" nginx nginx-common nginx-core nginx-full nginx-light nginx-extras; do
         [[ -z "$d" ]] && continue
         for f in "/usr/share/doc/$d/changelog.Debian.gz" "/usr/share/doc/$d/changelog.gz"; do
-          [[ -f "$f" ]] && out+="$(zcat "$f" 2>/dev/null || true)"$'\n'
+          [[ -f "$f" ]] && zcat "$f" 2>/dev/null
         done
       done
       ;;
-    rpm) out="$(rpm -q --changelog "${SYS_PKG:-nginx}" 2>/dev/null || true)" ;;
-    apk) out="$(apk info -a "${SYS_PKG:-nginx}" 2>/dev/null || true)" ;;
+    rpm) rpm -q --changelog "${SYS_PKG:-nginx}" 2>/dev/null ;;
+    apk) apk info -a "${SYS_PKG:-nginx}" 2>/dev/null ;;
   esac
-  printf '%s' "$out"
+  return 0
 }
 
-# Каким CVE дистрибутив ОТОЗВАЛ фикс (ABI-регрессии и т.п.).
-# Дистрибутивы регулярно выкатывают патч, а следующей ревизией отключают его:
+# Классификатор changelog целиком на awk: строковые эскейпы bash сюда не лезут.
+#
+# Дистрибутивы регулярно выкатывают фикс и следующей ревизией отключают его:
 #   1.24.0-2ubuntu7.14  SECURITY UPDATE: ... CVE-2026-42533-1.patch
-#   1.24.0-2ubuntu7.15  SECURITY REGRESSION: ... CVE-2026-42533-*.patch: Disabled for now.
-# Простой grep по CVE-ID увидит второй случай как «закрыто» — то есть наоборот.
-# Идём по записям changelog от новых к старым, первое решение по каждому CVE побеждает.
+#   1.24.0-2ubuntu7.15  SECURITY REGRESSION: CVE-2026-42533-*.patch: Disabled for now.
+# Простой grep по CVE-ID прочитает вторую строку как «закрыто» — наоборот.
+# Идём по записям сверху вниз (changelog отсортирован от новых к старым),
+# первое решение по каждому CVE окончательное: это заодно даёт «отключили, потом вернули».
+CHANGELOG_AWK='
+function decide(  cve, ctx, isrev) {
+  if (nl == 0) return
+  isreg = 0
+  for (i = 1; i <= nl; i++)
+    if (tolower(L[i]) ~ /security regression|regression update/) isreg = 1
+  for (cve in CTX) delete CTX[cve]
+  for (i = 1; i <= nl; i++) {
+    t = L[i]
+    while (match(t, /CVE-[0-9][0-9][0-9][0-9]-[0-9]+/)) {
+      cve = toupper(substr(t, RSTART, RLENGTH))
+      t = substr(t, RSTART + RLENGTH)
+      CTX[cve] = CTX[cve] " " tolower(L[i])
+    }
+  }
+  for (cve in CTX) {
+    if (cve in D) continue
+    ctx = CTX[cve]
+    isrev = 0
+    # откат засчитываем только внутри записи-регрессии и только если отключённым
+    # назван сам патч. "disabled duplicate atoms in Mp4" описывает, что делает
+    # патч; "Dropped: ... replaced with upstream" значит, что фикс приехал с версией.
+    if (isreg && ctx ~ /disabl|revert|backed out|dropped|removed|no longer/ &&
+        ctx !~ /replaced with upstream|fixed in [0-9]|superseded/) isrev = 1
+    D[cve] = isrev ? "R" : "F"
+  }
+  nl = 0
+}
+/^[a-zA-Z0-9][a-zA-Z0-9.+-]* \(/ { decide(); L[++nl] = $0; next }
+/^\* [A-Z][a-z][a-z] [A-Z][a-z][a-z] / { decide(); L[++nl] = $0; next }
+{ L[++nl] = $0 }
+END { decide(); for (c in D) print D[c] " " c }
+'
+
 distro_fixed_cves() {
-  local raw fixed="" reverted="" entry cve is_revert
-  raw="$(changelog_raw)"
-  [[ -z "$raw" ]] && return 0
-
-  # Записи changelog разделяются строкой, начинающейся с имени пакета: "nginx (версия) ..."
-  # или строкой "* дата - автор - версия" в rpm. Режем по ним, сохраняя порядок (новые сверху).
-  while IFS= read -r entry; do
-    [[ -z "$entry" ]] && continue
-    entry="$(printf '%b' "$entry")"
-    # Заголовок регрессии — надёжный маркер: дистрибутивы помечают им именно
-    # отзыв ранее выпущенного фикса. Без него слова вроде "disabled" в тексте
-    # означают, ЧТО ДЕЛАЕТ патч ("disabled duplicate atoms in Mp4"), а "Dropped:
-    # ... replaced with upstream" — что фикс приехал с новой версией. Это не откаты.
-    is_revert=0
-    grep -qiE 'SECURITY REGRESSION|REGRESSION UPDATE' <<< "$entry" && is_revert=1
-
-    while read -r cve; do
-      [[ -z "$cve" ]] && continue
-      # первое встреченное решение (самая свежая запись) — окончательное
-      grep -qxF "$cve" <<< "$fixed$reverted" && continue
-      # внутри записи-регрессии откатанным считается только тот CVE, чей патч
-      # прямо назван отключённым; остальные CVE записи могли быть просто упомянуты
-      if [[ $is_revert -eq 1 ]] \
-         && grep -iE "$cve" <<< "$entry" \
-            | grep -qiE 'disabl|revert|backed out|dropped|removed|no longer' \
-         && ! grep -iE "$cve" <<< "$entry" \
-            | grep -qiE 'replaced with upstream|fixed in [0-9]|superseded'; then
-        reverted+="$cve"$'\n'
-      else
-        fixed+="$cve"$'\n'
-      fi
-    done < <(grep -oiE 'CVE-[0-9]{4}-[0-9]+' <<< "$entry" | tr 'a-z' 'A-Z' | sort -u)
-  done < <(printf '%s' "$raw" | awk '
-      /^[a-zA-Z0-9][a-zA-Z0-9.+-]* \(/ || /^\* [A-Z][a-z][a-z] [A-Z][a-z][a-z] / {
-        if (buf != "") print buf; buf = $0 "\\n"; next
-      }
-      { buf = buf $0 "\\n" }
-      END { if (buf != "") print buf }
-  ')
-
-  # Выводим оба списка с префиксом: функция часто вызывается через $(...),
-  # то есть в субшелле, и присваивание переменных до вызывающего не доживёт.
-  printf '%s' "$fixed"    | grep -v '^$' | sed 's/^/F /' || true
-  printf '%s' "$reverted" | grep -v '^$' | sed 's/^/R /' || true
+  changelog_raw | tr -d '\000' | awk "$CHANGELOG_AWK" | sort -u
 }
 
 # Итоговый вердикт: список НЕзакрытых CVE (с учётом бэкпортов)
@@ -1203,8 +1210,14 @@ migrate_to_nginx_org() {
         local old_pkgs; old_pkgs="$(installed_nginx_debs | tr '\n' ' ')"
         # shellcheck disable=SC2086
         DEBIAN_FRONTEND=noninteractive apt-get purge -y $old_pkgs </dev/null >/dev/null 2>&1 || true
-        restore_user_configs
-        DEBIAN_FRONTEND=noninteractive apt-get install -y nginx </dev/null 2>&1 | sed 's/^/     /'
+        # ВАЖНО: сначала ставим пакет, потом возвращаем конфиги. Если положить свои
+        # файлы заранее, dpkg увидит их как изменённые conffile, спросит Y/I/N/O/D/Z,
+        # упрётся в EOF на stdin и оставит пакет в состоянии half-configured.
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          -o Dpkg::Options::=--force-confold \
+          -o Dpkg::Options::=--force-confdef \
+          nginx </dev/null > "$BACKUP_DIR/apt-reinstall.log" 2>&1 || true
+        tail -n 6 "$BACKUP_DIR/apt-reinstall.log" | sed 's/^/     /'
       fi
       ;;
     rpm)
@@ -1411,6 +1424,40 @@ upgrade_system() {
   inventory_system
   SYS_VULNS="$(open_cves "$SYS_VERSION")"
   acted "системный nginx мигрирован на nginx.org → $SYS_VERSION"
+
+  # Пакет должен быть не просто распакован, а настроен. Прерванный dpkg
+  # (например, интерактивный вопрос про conffile) оставляет состояние half-configured:
+  # nginx работает, а любой следующий apt падает.
+  ensure_pkg_configured
+
+  if [[ -z "$SYS_VULNS" ]]; then
+    ok "после миграции: nginx $SYS_VERSION, известных открытых CVE нет"
+    # пометки про отозванные дистрибутивом патчи потеряли смысл — мы ушли с них
+    manual_drop "патч дистрибутива отозван"
+    manual_drop "остаточные CVE"
+  else
+    warn "после миграции всё ещё открыто: $(echo "$SYS_VULNS" | cut -d'|' -f1 | tr '\n' ' ')"
+  fi
+  return 0
+}
+
+# Проверить и при необходимости починить состояние пакета после dpkg.
+ensure_pkg_configured() {
+  [[ "$PKG_FAMILY" == "deb" ]] || return 0
+  local st
+  st="$(dpkg-query -W -f='${Status}' nginx 2>/dev/null || true)"
+  [[ "$st" == "install ok installed" ]] && return 0
+  [[ -z "$st" ]] && return 0
+  warn "пакет nginx остался в состоянии «$st» — довожу dpkg --configure -a"
+  DEBIAN_FRONTEND=noninteractive dpkg --configure -a \
+    --force-confold --force-confdef </dev/null >/dev/null 2>&1 || true
+  st="$(dpkg-query -W -f='${Status}' nginx 2>/dev/null || true)"
+  if [[ "$st" == "install ok installed" ]]; then
+    ok "состояние пакета восстановлено"
+  else
+    err "пакет nginx в состоянии «$st» — следующий apt упадёт"
+    manual "починить пакет: dpkg --configure -a (или apt-get -f install)"
+  fi
   return 0
 }
 

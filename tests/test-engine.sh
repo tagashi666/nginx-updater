@@ -103,6 +103,38 @@ t "'disabled duplicate atoms' не откат" "0" "$(grep -c 'CVE-2022-41741' <
 t "'replaced with upstream' не откат" "0" "$(grep -c 'CVE-2021-23017' <<< "$_rev")"
 
 
+echo "--- устойчивость классификатора к грязному changelog ---"
+CL_DIRTY=$(printf '%s\n' \
+  'nginx (1.24.0-2ubuntu7.15) noble-security; urgency=medium' '' \
+  '  * SECURITY REGRESSION: Security fix may break ABI (LP: #2161362)' \
+  '    - debian/patches/CVE-2026-42533-*.patch: Disabled for now.' \
+  '    - broken escapes \\x2F \\xZZ \\x %s %d' '' \
+  ' -- M <m@e.com>  Mon, 20 Jul 2026 15:12:12 -0400' '' \
+  'nginx (1.24.0-2ubuntu7.8) noble-security; urgency=medium' '' \
+  '  * SECURITY UPDATE: heap overflow' \
+  '    - CVE-2026-42945' '' \
+  ' -- M <m@e.com>  Wed, 14 May 2026 10:00:00 -0400')
+changelog_raw() { printf '%s' "$CL_DIRTY"; }
+_o="$(distro_fixed_cves 2>/tmp/ngxup-t.err)"
+t "битые \\x не ломают разбор" "0" "$(wc -c < /tmp/ngxup-t.err | tr -d ' ')"
+t "откат распознан на грязном"  "1" "$(grep -c '^R CVE-2026-42533$' <<< "$_o")"
+t "Rift закрыт на грязном"      "1" "$(grep -c '^F CVE-2026-42945$' <<< "$_o")"
+rm -f /tmp/ngxup-t.err
+
+echo "--- manual_drop снимает устаревшие пометки ---"
+NEEDS_MANUAL=(); NEEDS_MANUAL_N=0; EXIT_CODE=0
+manual "CVE-2026-42533: патч дистрибутива отозван, штатное обновление не поможет"
+manual "обновить OpenResty вручную"
+t "две пометки записаны" "2" "$NEEDS_MANUAL_N"
+t "EXIT_CODE стал 2"     "2" "$EXIT_CODE"
+manual_drop "патч дистрибутива отозван"
+t "осталась одна"        "1" "$NEEDS_MANUAL_N"
+t "осталась нужная"      "1" "$(printf '%s\n' "${NEEDS_MANUAL[@]}" | grep -c OpenResty)"
+manual_drop "OpenResty"
+t "пусто"                "0" "$NEEDS_MANUAL_N"
+t "EXIT_CODE вернулся в 0" "0" "$EXIT_CODE"
+
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
