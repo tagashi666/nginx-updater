@@ -903,6 +903,7 @@ repair_http2() {
         touched=1
         rm -f "$f.ngxup-bak"
       else
+        warn "$(basename "$f"): миграция http2 не прошла nginx -t — откатил, файл не тронут"
         cp -a "$f.ngxup-bak" "$f"; rm -f "$f.ngxup-bak"
       fi
     fi
